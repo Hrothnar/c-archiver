@@ -1,0 +1,1 @@
+This program archives files in a folder by their links (.lnk)
