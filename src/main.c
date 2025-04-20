@@ -1,39 +1,195 @@
-#include <stdio.h>
+/*
+ * backup_with_minizip.c
+ *
+ * Simple backup utility for Windows:
+ * - Resolves .lnk shortcuts via COM
+ * - Recursively collects files, preserves structure, metadata, Unicode filenames
+ * - Creates a ZIP using minizip-ng
+ * - Displays console progress with fixed-width percentages
+ *
+ * Requirements:
+ *  - Windows OS
+ *  - GCC (MinGW-w64)
+ *  - minizip-ng library with zstd, bcrypt
+ *  - Link: -lminizip-ng -lzstd -lbcrypt -luuid -lshell32 -lshlwapi -lcomdlg32 -lole32 -loleaut32
+ *
+ * Build:
+ * gcc -std=c23 -o backup_with_minizip.exe main.c \
+ *   -Iinclude -Llib \
+ *   -lminizip-ng -lzstd -lbcrypt -luuid -lshell32 \
+ *   -lshlwapi -lcomdlg32 -lole32 -loleaut32
+ *
+ * Usage:
+ * backup_with_minizip.exe <source_folder> <output_zip>
+ */
 
-#define INCHES_PER_POUND 166 // directive declaration
-
-void one(); // function declaration
-void two();
-
-int main () {
-    printf("Hello world!. I wrote my firs program ic C!\n");
-
-    one();
-    two();
-
-
-    return 0;
-}
-
-void one() {
-    int integer = 2;
-    float floatingPoint = 5.0256f;
-    printf("An integer number is: %d, a floating point number is: %.2f\n", integer, floatingPoint); // 0.nf - round a number to n chars
-}
-
-void two() {
-    int height, length, width, volume, weight;
-
-    printf("Enter height of box: ");
-    scanf("%d", &height);
-    printf("Enter length of box: ");
-    scanf("%d", &length);
-    printf("Enter width of box: ");
-    scanf("%d", &width);
-
-    volume = height * length * width;
-    weight = (volume + INCHES_PER_POUND - 1) / INCHES_PER_POUND;
-
-    printf("Volume (cubic inches): %d\n", volume);
-    printf("Dimensional weight (pounds): %d\n", weight);
-}
+ #include <windows.h>
+ #include <shlobj.h>
+ #include <shobjidl.h>
+ #include <objbase.h>
+ #include <shellapi.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <locale.h>
+ 
+ #include "mz.h"
+ #include "mz_strm.h"
+ #include "mz_strm_buf.h"
+ #include "mz_strm_os.h"
+ #include "mz_zip.h"
+ #include "mz_zip_rw.h"
+ 
+ #define PATH_MAX_LEN 1024
+ 
+ typedef struct FileEntry {
+     wchar_t full[PATH_MAX_LEN];
+     wchar_t rel[PATH_MAX_LEN];
+ } FileEntry;
+ 
+ // Recursively collect file paths under base_dir
+ static void collect_entries(const wchar_t *base_dir, const wchar_t *curr_dir,
+                             FileEntry **arr, int *cnt, int *cap) {
+     WIN32_FIND_DATAW ffd;
+     HANDLE hFind;
+     wchar_t pattern[PATH_MAX_LEN];
+     wsprintfW(pattern, L"%s\\*", curr_dir);
+     hFind = FindFirstFileW(pattern, &ffd);
+     if (hFind == INVALID_HANDLE_VALUE) return;
+     do {
+         if (wcscmp(ffd.cFileName, L".") == 0 || wcscmp(ffd.cFileName, L"..") == 0)
+             continue;
+         wchar_t full_path[PATH_MAX_LEN];
+         wsprintfW(full_path, L"%s\\%s", curr_dir, ffd.cFileName);
+         // compute relative to base_dir
+         size_t base_len = wcslen(base_dir);
+         wchar_t rel_part[PATH_MAX_LEN];
+         if (wcsncmp(full_path, base_dir, base_len)==0 && full_path[base_len]==L'\\')
+             wcscpy(rel_part, full_path + base_len + 1);
+         else
+             wcscpy(rel_part, ffd.cFileName);
+         // resize
+         if (*cnt >= *cap) {
+             *cap *= 2;
+             *arr = realloc(*arr, (*cap) * sizeof(FileEntry));
+         }
+         wcscpy((*arr)[*cnt].full, full_path);
+         wcscpy((*arr)[*cnt].rel, rel_part);
+         (*cnt)++;
+         if (ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+             collect_entries(base_dir, full_path, arr, cnt, cap);
+     } while (FindNextFileW(hFind, &ffd));
+     FindClose(hFind);
+ }
+ 
+ static BOOL resolve_link(LPCWSTR link_path, LPWSTR out_path, size_t max_len) {
+     IShellLinkW *psl = NULL;
+     IPersistFile *ppf = NULL;
+     HRESULT hr = CoInitialize(NULL);
+     if (FAILED(hr)) return FALSE;
+     hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                           &IID_IShellLinkW, (void**)&psl);
+     if (SUCCEEDED(hr)) hr = psl->lpVtbl->QueryInterface(psl, &IID_IPersistFile, (void**)&ppf);
+     if (SUCCEEDED(hr)) hr = ppf->lpVtbl->Load(ppf, link_path, STGM_READ);
+     if (SUCCEEDED(hr)) hr = psl->lpVtbl->GetPath(psl, out_path, (int)max_len, NULL, SLGP_RAWPATH);
+     if (ppf) ppf->lpVtbl->Release(ppf);
+     if (psl) psl->lpVtbl->Release(psl);
+     CoUninitialize();
+     return SUCCEEDED(hr);
+ }
+ 
+ int wmain(int argc, wchar_t *argv[]) {
+     setlocale(LC_ALL, "");
+     if (argc != 3) {
+         fwprintf(stderr, L"Usage: %s <source_folder> <output_zip>\n", argv[0]);
+         return 1;
+     }
+     // Allocate entries
+     FileEntry *entries = malloc(16 * sizeof(FileEntry));
+     int count = 0, cap = 16;
+ 
+     // Process each .lnk in source folder
+     wchar_t link_pattern[PATH_MAX_LEN];
+     wsprintfW(link_pattern, L"%s\\*.lnk", argv[1]);
+     WIN32_FIND_DATAW ffd;
+     HANDLE hFind = FindFirstFileW(link_pattern, &ffd);
+     if (hFind != INVALID_HANDLE_VALUE) {
+         do {
+             wchar_t link_path[PATH_MAX_LEN];
+             wsprintfW(link_path, L"%s\\%s", argv[1], ffd.cFileName);
+             wchar_t target_dir[PATH_MAX_LEN];
+             if (!resolve_link(link_path, target_dir, PATH_MAX_LEN))
+                 continue;
+ 
+             // derive link name, remove extension and suffix
+             wchar_t link_name[PATH_MAX_LEN];
+             wcscpy(link_name, ffd.cFileName);
+             wchar_t *dot = wcsrchr(link_name, L'.');
+             if (dot && (_wcsicmp(dot, L".lnk")==0)) *dot = L'\0';
+             // remove " - Ярлык" suffix
+             const wchar_t suffix[] = L" - Ярлык";
+             size_t lname = wcslen(link_name);
+             size_t slen = wcslen(suffix);
+             if (lname > slen && wcscmp(link_name + lname - slen, suffix) == 0)
+                 link_name[lname - slen] = L'\0';
+ 
+             // collect target entries
+             FileEntry *temp = malloc(16 * sizeof(FileEntry));
+             int tcount = 0, tcap = 16;
+             collect_entries(target_dir, target_dir, &temp, &tcount, &tcap);
+             for (int j = 0; j < tcount; j++) {
+                 if (count >= cap) {
+                     cap *= 2;
+                     entries = realloc(entries, cap * sizeof(FileEntry));
+                 }
+                 wcscpy(entries[count].full, temp[j].full);
+                 wsprintfW(entries[count].rel, L"%s\\%s", link_name, temp[j].rel);
+                 count++;
+             }
+             free(temp);
+         } while (FindNextFileW(hFind, &ffd));
+         FindClose(hFind);
+     }
+     if (count == 0) {
+         wprintf(L"No files to archive.\n");
+         return 1;
+     }
+ 
+     // Initialize zip
+     void *zip = mz_zip_writer_create();
+     char zipPath[PATH_MAX_LEN];
+     WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, zipPath, PATH_MAX_LEN, NULL, NULL);
+     if (mz_zip_writer_open_file(zip, zipPath, 0, 0) != MZ_OK) {
+         fwprintf(stderr, L"Cannot open %s\n", argv[2]);
+         mz_zip_writer_delete(&zip);
+         return 1;
+     }
+ 
+     // Archive files with progress
+     for (int i = 0; i < count; i++) {
+         char fullUtf[PATH_MAX_LEN], relUtf[PATH_MAX_LEN];
+         WideCharToMultiByte(CP_UTF8, 0, entries[i].full, -1, fullUtf, PATH_MAX_LEN, NULL, NULL);
+         WideCharToMultiByte(CP_UTF8, 0, entries[i].rel, -1, relUtf, PATH_MAX_LEN, NULL, NULL);
+         int pct = (i * 100) / count;
+         wprintf(L"[%3d%%] %s\r", pct, entries[i].rel);
+         // add only files (directories implicit)
+         DWORD attr = GetFileAttributesW(entries[i].full);
+         if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+             mz_zip_writer_add_file(zip, fullUtf, relUtf);
+         }
+     }
+     wprintf(L"\nDone: %d items -> %s\n", count, argv[2]);
+ 
+     mz_zip_writer_close(zip);
+     mz_zip_writer_delete(&zip);
+     free(entries);
+     return 0;
+ }
+ 
+ #if !defined(__MINGW64_VERSION_MAJOR__)
+ int main(int argc, char **argv) {
+     int wargc; wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+     int res = wmain(wargc, wargv);
+     LocalFree(wargv);
+     return res;
+ }
+ #endif 
