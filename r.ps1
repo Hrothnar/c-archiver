@@ -1,1 +1,1 @@
-gcc -std=c23 -o backup.exe .\src\main.c -Iinclude -Llib -lminizip-ng -lzstd -lbcrypt -luuid -lshell32 -lshlwapi -lcomdlg32 -lole32 -loleaut32
+gcc -std=c23 -o archiver.exe .\src\main.c -Iinclude -Llib -lminizip-ng -lzstd -lbcrypt -luuid -lshell32 -lshlwapi -lcomdlg32 -lole32 -loleaut32
